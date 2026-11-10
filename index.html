@@ -1,0 +1,1132 @@
+"use client";
+
+import React, { useState, useEffect, useMemo, useRef } from "react";
+import {
+  Search,
+  Star,
+  GitFork,
+  Eye,
+  AlertCircle,
+  MapPin,
+  Building2,
+  Link as LinkIcon,
+  Calendar,
+  KeyRound,
+  Sun,
+  Moon,
+  ExternalLink,
+  X,
+  GitCommit,
+  Activity,
+  BarChart3,
+  BookOpen,
+  Clock,
+  RefreshCw,
+} from "lucide-react";
+import { marked } from "marked";
+
+// --- Types ---
+interface GitHubUser {
+  login: string;
+  name: string | null;
+  avatar_url: string;
+  html_url: string;
+  bio: string | null;
+  company: string | null;
+  location: string | null;
+  blog: string | null;
+  twitter_username: string | null;
+  followers: number;
+  following: number;
+  public_repos: number;
+  created_at: string;
+}
+
+interface GitHubRepo {
+  id: number;
+  name: string;
+  full_name: string;
+  html_url: string;
+  description: string | null;
+  stargazers_count: number;
+  forks_count: number;
+  watchers_count: number;
+  open_issues_count: number;
+  language: string | null;
+  topics: string[];
+  pushed_at: string;
+  updated_at: string;
+  private: boolean;
+  owner: { login: string };
+}
+
+interface GitHubEvent {
+  id: string;
+  type: string;
+  created_at: string;
+  repo: { name: string };
+  payload: {
+    action?: string;
+    ref?: string;
+    ref_type?: string;
+    commits?: Array<{ sha: string; message: string }>;
+    pull_request?: { title: string; number: number };
+    issue?: { title: string; number: number };
+    release?: { tag_name: string; name: string };
+  };
+}
+
+// --- Constants & Helpers ---
+const NOTABLE_PROFILES = [
+  "rohitvaddepalli",
+  "torvalds",
+  "gaearon",
+  "shadcn",
+  "yyx990803",
+  "sindresorhus",
+  "vercel",
+];
+
+const LANG_COLORS: Record<string, string> = {
+  TypeScript: "#3178c6",
+  JavaScript: "#f1e05a",
+  Python: "#3572A5",
+  HTML: "#e34c26",
+  CSS: "#563d7c",
+  Rust: "#dea584",
+  Go: "#00ADD8",
+  Java: "#b07219",
+  "C++": "#f34b7d",
+  C: "#555555",
+  Shell: "#89e051",
+  Vue: "#41b883",
+  Jupyter: "#DA5B0B",
+  Other: "#8b949e",
+};
+
+function formatRelativeTime(isoDate: string): string {
+  if (!isoDate) return "";
+  const diffSec = Math.floor((Date.now() - new Date(isoDate).getTime()) / 1000);
+  if (diffSec < 60) return "just now";
+  const units: [string, number][] = [
+    ["y", 31536000],
+    ["mo", 2592000],
+    ["d", 86400],
+    ["h", 3600],
+    ["m", 60],
+  ];
+  for (const [label, secs] of units) {
+    const val = Math.floor(diffSec / secs);
+    if (val >= 1) return `${val}${label} ago`;
+  }
+  return "just now";
+}
+
+export default function GitHubProfileExplorer() {
+  // Read ?user= query parameter on mount
+  const [activeUser, setActiveUser] = useState<string>("rohitvaddepalli");
+  const [searchInput, setSearchInput] = useState<string>("rohitvaddepalli");
+  const [theme, setTheme] = useState<"dark" | "light">("dark");
+
+  // API Token State
+  const [token, setToken] = useState<string>("");
+  const [tokenModalOpen, setTokenModalOpen] = useState<boolean>(false);
+  const [rateLimit, setRateLimit] = useState<{
+    remaining: number | null;
+    limit: number | null;
+    reset: string | null;
+  }>({ remaining: null, limit: null, reset: null });
+
+  // Data States
+  const [profile, setProfile] = useState<GitHubUser | null>(null);
+  const [repos, setRepos] = useState<GitHubRepo[]>([]);
+  const [events, setEvents] = useState<GitHubEvent[]>([]);
+  const [loading, setLoading] = useState<boolean>(true);
+  const [error, setError] = useState<string | null>(null);
+
+  // Repo Filter & UI Tab States
+  const [activeTab, setActiveTab] = useState<"repos" | "analytics" | "activity">("repos");
+  const [repoKeyword, setRepoKeyword] = useState<string>("");
+  const [repoLanguage, setRepoLanguage] = useState<string>("All");
+  const [repoSort, setRepoSort] = useState<"stars" | "updated" | "name">("stars");
+
+  // README Drawer State
+  const [drawerRepo, setDrawerRepo] = useState<GitHubRepo | null>(null);
+  const [readmeHtml, setReadmeHtml] = useState<string>("");
+  const [readmeLoading, setReadmeLoading] = useState<boolean>(false);
+
+  // Recent Search History
+  const [recentUsers, setRecentUsers] = useState<string[]>(["rohitvaddepalli", "torvalds"]);
+
+  const searchRef = useRef<HTMLInputElement>(null);
+
+  // Initialize from URL & localStorage
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const urlUser = params.get("user");
+    if (urlUser) {
+      setActiveUser(urlUser);
+      setSearchInput(urlUser);
+    }
+    const savedToken = localStorage.getItem("gh_explorer_pat") || "";
+    setToken(savedToken);
+
+    try {
+      const savedRecent = JSON.parse(localStorage.getItem("gh_recent_users") || "null");
+      if (Array.isArray(savedRecent) && savedRecent.length > 0) {
+        setRecentUsers(savedRecent);
+      }
+    } catch {}
+  }, []);
+
+  // Sync dark/light class
+  useEffect(() => {
+    const root = document.documentElement;
+    if (theme === "dark") root.classList.add("dark");
+    else root.classList.remove("dark");
+  }, [theme]);
+
+  // Keyboard shortcuts: '/' to focus search, 'Escape' to close modals
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (
+        e.key === "/" &&
+        document.activeElement !== searchRef.current &&
+        !["INPUT", "TEXTAREA", "SELECT"].includes((document.activeElement as HTMLElement)?.tagName)
+      ) {
+        e.preventDefault();
+        searchRef.current?.focus();
+      }
+      if (e.key === "Escape") {
+        setDrawerRepo(null);
+        setTokenModalOpen(false);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+
+  const buildHeaders = () => {
+    const h: Record<string, string> = { Accept: "application/vnd.github.v3+json" };
+    if (token.trim()) h.Authorization = `Bearer ${token.trim()}`;
+    return h;
+  };
+
+  // Fetch GitHub User, Repos & Events
+  const loadProfileData = async (username: string) => {
+    const clean = username.trim().replace(/^@/, "");
+    if (!clean) return;
+
+    setLoading(true);
+    setError(null);
+    setDrawerRepo(null);
+
+    // Update URL ?user= param
+    const nextUrl = `${window.location.pathname}?user=${encodeURIComponent(clean)}`;
+    window.history.replaceState({ path: nextUrl }, "", nextUrl);
+
+    try {
+      const headers = buildHeaders();
+      const [uRes, rRes, eRes] = await Promise.all([
+        fetch(`https://api.github.com/users/${encodeURIComponent(clean)}`, { headers }),
+        fetch(`https://api.github.com/users/${encodeURIComponent(clean)}/repos?per_page=100&sort=updated`, { headers }),
+        fetch(`https://api.github.com/users/${encodeURIComponent(clean)}/events/public?per_page=100`, { headers }),
+      ]);
+
+      const rem = uRes.headers.get("x-ratelimit-remaining");
+      const lim = uRes.headers.get("x-ratelimit-limit");
+      const rst = uRes.headers.get("x-ratelimit-reset");
+      if (rem !== null) {
+        setRateLimit({
+          remaining: Number(rem),
+          limit: Number(lim),
+          reset: rst ? new Date(Number(rst) * 1000).toLocaleTimeString() : null,
+        });
+      }
+
+      if (uRes.status === 404) {
+        throw new Error(`User "@${clean}" was not found on GitHub.`);
+      }
+      if (uRes.status === 403 || uRes.status === 429) {
+        throw new Error(
+          "GitHub API rate limit exceeded (60 requests/hr anonymous limit). Add a Personal Access Token in the header to unlock 5,000 requests/hr."
+        );
+      }
+      if (!uRes.ok) {
+        throw new Error(`GitHub API returned status ${uRes.status}.`);
+      }
+
+      const uData: GitHubUser = await uRes.json();
+      const rData: GitHubRepo[] = rRes.ok ? await rRes.json() : [];
+      const eData: GitHubEvent[] = eRes.ok ? await eRes.json() : [];
+
+      setProfile(uData);
+      setRepos(Array.isArray(rData) ? rData : []);
+      setEvents(Array.isArray(eData) ? eData : []);
+      setRepoLanguage("All");
+
+      setRecentUsers((prev) => {
+        const updated = [
+          uData.login,
+          ...prev.filter((item) => item.toLowerCase() !== uData.login.toLowerCase()),
+        ].slice(0, 8);
+        localStorage.setItem("gh_recent_users", JSON.stringify(updated));
+        return updated;
+      });
+    } catch (err: any) {
+      setError(err.message || "Unexpected network error.");
+      setProfile(null);
+      setRepos([]);
+      setEvents([]);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    loadProfileData(activeUser);
+  }, [activeUser, token]);
+
+  // Fetch & Render Repo README in Drawer
+  const handleOpenRepoDrawer = async (repo: GitHubRepo) => {
+    setDrawerRepo(repo);
+    setReadmeLoading(true);
+    setReadmeHtml("");
+    try {
+      const res = await fetch(
+        `https://api.github.com/repos/${repo.owner.login}/${repo.name}/readme`,
+        { headers: buildHeaders() }
+      );
+      if (!res.ok) {
+        setReadmeHtml("<p class='text-zinc-400 italic'>No README.md found for this repository.</p>");
+      } else {
+        const data = await res.json();
+        const rawMarkdown = new TextDecoder().decode(
+          Uint8Array.from(atob(data.content.replace(/\n/g, "")), (c) => c.charCodeAt(0))
+        );
+        const parsed = await marked.parse(rawMarkdown);
+        setReadmeHtml(parsed);
+      }
+    } catch {
+      setReadmeHtml("<p class='text-red-400'>Failed to load README.md.</p>");
+    } finally {
+      setReadmeLoading(false);
+    }
+  };
+
+  // --- Aggregated Stats & Chart Data ---
+  const aggregated = useMemo(() => {
+    let stars = 0;
+    let forks = 0;
+    let watchers = 0;
+    let openIssues = 0;
+    const langMap: Record<string, number> = {};
+
+    for (const r of repos) {
+      stars += r.stargazers_count || 0;
+      forks += r.forks_count || 0;
+      watchers += r.watchers_count || 0;
+      openIssues += r.open_issues_count || 0;
+      if (r.language) {
+        langMap[r.language] = (langMap[r.language] || 0) + 1;
+      }
+    }
+
+    const totalLangCount = Object.values(langMap).reduce((a, b) => a + b, 0) || 1;
+    const languages = Object.entries(langMap)
+      .sort((a, b) => b[1] - a[1])
+      .map(([name, count]) => ({
+        name,
+        count,
+        percent: Math.round((count / totalLangCount) * 1000) / 10,
+        color: LANG_COLORS[name] || LANG_COLORS.Other,
+      }));
+
+    // SVG Donut segments
+    let cumulativePercent = 0;
+    const donutSegments = languages.map((l) => {
+      const start = cumulativePercent;
+      cumulativePercent += l.percent;
+      return { ...l, startOffset: start };
+    });
+
+    const topRepos = [...repos]
+      .sort(
+        (a, b) =>
+          b.stargazers_count - a.stargazers_count ||
+          new Date(b.pushed_at).getTime() - new Date(a.pushed_at).getTime()
+      )
+      .slice(0, 6);
+
+    return { stars, forks, watchers, openIssues, languages, donutSegments, topRepos };
+  }, [repos]);
+
+  // Filtered Repositories
+  const filteredRepos = useMemo(() => {
+    return repos
+      .filter((r) => {
+        const langMatch = repoLanguage === "All" || r.language === repoLanguage;
+        const q = repoKeyword.trim().toLowerCase();
+        const keywordMatch =
+          !q ||
+          r.name.toLowerCase().includes(q) ||
+          (r.description && r.description.toLowerCase().includes(q)) ||
+          (r.topics && r.topics.some((t) => t.toLowerCase().includes(q)));
+        return langMatch && keywordMatch;
+      })
+      .sort((a, b) => {
+        if (repoSort === "stars") return b.stargazers_count - a.stargazers_count;
+        if (repoSort === "updated")
+          return new Date(b.pushed_at).getTime() - new Date(a.pushed_at).getTime();
+        return a.name.localeCompare(b.name);
+      });
+  }, [repos, repoKeyword, repoLanguage, repoSort]);
+
+  // 16-Week Contribution Heatmap Matrix
+  const heatmapGrid = useMemo(() => {
+    const map: Record<string, number> = {};
+    events.forEach((ev) => {
+      const dateKey = ev.created_at?.slice(0, 10);
+      if (dateKey) {
+        const weight = ev.type === "PushEvent" ? ev.payload?.commits?.length || 1 : 1;
+        map[dateKey] = (map[dateKey] || 0) + weight;
+      }
+    });
+
+    const weeks: Array<Array<{ date: string; count: number }>> = [];
+    const today = new Date();
+    const totalDays = 16 * 7;
+    const start = new Date(today);
+    start.setDate(today.getDate() - totalDays + 1);
+
+    let week: Array<{ date: string; count: number }> = [];
+    for (let i = 0; i < totalDays; i++) {
+      const d = new Date(start);
+      d.setDate(start.getDate() + i);
+      const iso = d.toISOString().slice(0, 10);
+      week.push({ date: iso, count: map[iso] || 0 });
+      if (week.length === 7) {
+        weeks.push(week);
+        week = [];
+      }
+    }
+    if (week.length > 0) weeks.push(week);
+    return weeks;
+  }, [events]);
+
+  // Describe Event for Activity Feed
+  const describeEvent = (ev: GitHubEvent) => {
+    switch (ev.type) {
+      case "PushEvent":
+        return `Pushed ${ev.payload.commits?.length || 1} commit(s) to`;
+      case "PullRequestEvent":
+        return `${ev.payload.action || "Updated"} pull request in`;
+      case "IssuesEvent":
+        return `${ev.payload.action || "Updated"} issue in`;
+      case "WatchEvent":
+        return "Starred repository";
+      case "CreateEvent":
+        return `Created ${ev.payload.ref_type || "branch"} ${ev.payload.ref || ""} in`;
+      case "ReleaseEvent":
+        return `Published release ${ev.payload.release?.tag_name || ""} in`;
+      case "ForkEvent":
+        return "Forked repository";
+      default:
+        return `${ev.type.replace("Event", "")} on`;
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-white dark:bg-zinc-950 text-zinc-900 dark:text-zinc-100 transition-colors">
+      {/* Sticky Top Navbar */}
+      <header className="sticky top-0 z-30 border-b border-zinc-200 dark:border-zinc-800 bg-white/85 dark:bg-zinc-950/85 backdrop-blur-md">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 py-3 flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-2.5">
+            <div className="h-9 w-9 rounded-lg bg-blue-600 text-white font-bold flex items-center justify-center shadow-sm">
+              GH
+            </div>
+            <div>
+              <h1 className="text-base font-bold leading-none">GitPulse Explorer</h1>
+              <p className="text-xs text-zinc-500 dark:text-zinc-400 mt-0.5">
+                Public GitHub Analytics & Repo Browser
+              </p>
+            </div>
+          </div>
+
+          {/* Search Form */}
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              if (searchInput.trim()) setActiveUser(searchInput.trim());
+            }}
+            className="flex-1 max-w-md flex items-center gap-2"
+          >
+            <div className="relative flex-1">
+              <Search className="w-4 h-4 text-zinc-400 absolute left-3 top-2.5" />
+              <input
+                ref={searchRef}
+                type="text"
+                value={searchInput}
+                onChange={(e) => setSearchInput(e.target.value)}
+                placeholder="Search username (e.g. rohitvaddepalli, torvalds)..."
+                aria-label="Search GitHub username"
+                className="w-full pl-9 pr-10 py-1.5 text-sm rounded-lg border border-zinc-300 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-900 focus:outline-none focus:ring-2 focus:ring-blue-500"
+              />
+              <kbd className="hidden sm:inline-block absolute right-2.5 top-2 px-1.5 py-0.5 text-[10px] font-mono bg-zinc-200 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-400 rounded">
+                /
+              </kbd>
+            </div>
+            <button
+              type="submit"
+              className="px-4 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium transition"
+            >
+              Load
+            </button>
+          </form>
+
+          {/* Controls */}
+          <div className="flex items-center gap-2">
+            {rateLimit.remaining !== null && (
+              <span
+                title={`Quota resets at ${rateLimit.reset}`}
+                className={`hidden md:inline-flex items-center px-2.5 py-1 rounded-full text-xs font-medium border ${
+                  rateLimit.remaining < 10
+                    ? "border-red-500/40 bg-red-500/10 text-red-400"
+                    : "border-zinc-200 dark:border-zinc-800 bg-zinc-100 dark:bg-zinc-900 text-zinc-600 dark:text-zinc-400"
+                }`}
+              >
+                Quota: {rateLimit.remaining}/{rateLimit.limit}
+              </span>
+            )}
+
+            <button
+              onClick={() => setTokenModalOpen(true)}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-zinc-200 dark:border-zinc-800 hover:bg-zinc-100 dark:hover:bg-zinc-900 text-xs font-medium transition"
+            >
+              <KeyRound className="w-3.5 h-3.5 text-blue-500" />
+              <span>{token ? "Token Active" : "API Token"}</span>
+            </button>
+
+            <button
+              onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
+              aria-label="Toggle theme"
+              className="p-2 rounded-lg border border-zinc-200 dark:border-zinc-800 hover:bg-zinc-100 dark:hover:bg-zinc-900 transition"
+            >
+              {theme === "dark" ? <Sun className="w-4 h-4 text-amber-400" /> : <Moon className="w-4 h-4" />}
+            </button>
+          </div>
+        </div>
+
+        {/* Notable & Recent Bar */}
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 py-2 border-t border-zinc-200/60 dark:border-zinc-800/60 flex flex-wrap items-center gap-2 text-xs">
+          <span className="text-zinc-500 font-medium">Explore:</span>
+          {NOTABLE_PROFILES.map((u) => (
+            <button
+              key={u}
+              onClick={() => {
+                setSearchInput(u);
+                setActiveUser(u);
+              }}
+              className={`px-2 py-0.5 rounded-md transition ${
+                activeUser.toLowerCase() === u.toLowerCase()
+                  ? "bg-blue-600 text-white font-medium"
+                  : "bg-zinc-100 dark:bg-zinc-900 hover:bg-zinc-200 dark:hover:bg-zinc-800"
+              }`}
+            >
+              @{u}
+            </button>
+          ))}
+
+          {recentUsers.length > 0 && (
+            <>
+              <span className="text-zinc-400 ml-2 pl-2 border-l border-zinc-200 dark:border-zinc-800 flex items-center gap-1">
+                <Clock className="w-3 h-3" /> Recent:
+              </span>
+              {recentUsers.map((u) => (
+                <button
+                  key={`rec-${u}`}
+                  onClick={() => {
+                    setSearchInput(u);
+                    setActiveUser(u);
+                  }}
+                  className="px-2 py-0.5 rounded-md border border-zinc-200 dark:border-zinc-800 hover:bg-zinc-100 dark:hover:bg-zinc-900 text-zinc-600 dark:text-zinc-400 transition"
+                >
+                  {u}
+                </button>
+              ))}
+            </>
+          )}
+        </div>
+      </header>
+
+      {/* Main Content Container */}
+      <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6">
+        {/* Error State */}
+        {error && (
+          <div className="max-w-xl mx-auto my-8 rounded-xl border border-red-500/40 bg-red-500/10 p-6 text-center">
+            <AlertCircle className="w-8 h-8 text-red-400 mx-auto mb-2" />
+            <h2 className="text-base font-bold text-red-400">Could Not Load GitHub Profile</h2>
+            <p className="text-sm text-zinc-600 dark:text-zinc-300 mt-1 mb-4">{error}</p>
+            <div className="flex justify-center gap-3">
+              <button
+                onClick={() => {
+                  setSearchInput("rohitvaddepalli");
+                  setActiveUser("rohitvaddepalli");
+                }}
+                className="px-4 py-2 rounded-lg bg-blue-600 text-white text-xs font-medium"
+              >
+                Load @rohitvaddepalli
+              </button>
+              <button
+                onClick={() => setTokenModalOpen(true)}
+                className="px-4 py-2 rounded-lg border border-zinc-300 dark:border-zinc-700 text-xs font-medium"
+              >
+                Add API Token
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Skeleton Loader */}
+        {loading && !error && (
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 animate-pulse">
+            <div className="lg:col-span-4 space-y-4">
+              <div className="h-80 rounded-xl bg-zinc-200 dark:bg-zinc-900" />
+              <div className="h-56 rounded-xl bg-zinc-200 dark:bg-zinc-900" />
+            </div>
+            <div className="lg:col-span-8 space-y-4">
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+                {[1, 2, 3, 4].map((i) => (
+                  <div key={i} className="h-24 rounded-xl bg-zinc-200 dark:bg-zinc-900" />
+                ))}
+              </div>
+              <div className="h-96 rounded-xl bg-zinc-200 dark:bg-zinc-900" />
+            </div>
+          </div>
+        )}
+
+        {/* Active Profile Dashboard */}
+        {!loading && !error && profile && (
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+            {/* Sidebar Profile Info & Language Donut */}
+            <aside className="lg:col-span-4 space-y-6">
+              <div className="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50/50 dark:bg-zinc-900/50 p-6">
+                <div className="flex flex-col items-center text-center">
+                  <img
+                    src={profile.avatar_url}
+                    alt={profile.login}
+                    className="w-28 h-28 rounded-full border-2 border-blue-500/40 shadow-md object-cover"
+                  />
+                  <h2 className="text-xl font-bold mt-3">{profile.name || profile.login}</h2>
+                  <a
+                    href={profile.html_url}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="inline-flex items-center gap-1 text-sm text-blue-500 hover:underline font-mono"
+                  >
+                    @{profile.login} <ExternalLink className="w-3.5 h-3.5" />
+                  </a>
+                  {profile.bio && (
+                    <p className="text-sm text-zinc-600 dark:text-zinc-400 mt-2">{profile.bio}</p>
+                  )}
+                </div>
+
+                <div className="grid grid-cols-3 gap-2 my-5 py-3 border-y border-zinc-200 dark:border-zinc-800 text-center">
+                  <div>
+                    <div className="text-lg font-bold">{profile.followers.toLocaleString()}</div>
+                    <div className="text-[11px] text-zinc-500 uppercase">Followers</div>
+                  </div>
+                  <div>
+                    <div className="text-lg font-bold">{profile.following.toLocaleString()}</div>
+                    <div className="text-[11px] text-zinc-500 uppercase">Following</div>
+                  </div>
+                  <div>
+                    <div className="text-lg font-bold">{profile.public_repos.toLocaleString()}</div>
+                    <div className="text-[11px] text-zinc-500 uppercase">Repos</div>
+                  </div>
+                </div>
+
+                <ul className="space-y-2.5 text-sm text-zinc-600 dark:text-zinc-400">
+                  {profile.company && (
+                    <li className="flex items-center gap-2">
+                      <Building2 className="w-4 h-4 shrink-0 text-zinc-400" />
+                      <span className="truncate">{profile.company}</span>
+                    </li>
+                  )}
+                  {profile.location && (
+                    <li className="flex items-center gap-2">
+                      <MapPin className="w-4 h-4 shrink-0 text-zinc-400" />
+                      <span className="truncate">{profile.location}</span>
+                    </li>
+                  )}
+                  {profile.blog && (
+                    <li className="flex items-center gap-2">
+                      <LinkIcon className="w-4 h-4 shrink-0 text-zinc-400" />
+                      <a
+                        href={profile.blog.startsWith("http") ? profile.blog : `https://${profile.blog}`}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="text-blue-500 hover:underline truncate"
+                      >
+                        {profile.blog}
+                      </a>
+                    </li>
+                  )}
+                  <li className="flex items-center gap-2">
+                    <Calendar className="w-4 h-4 shrink-0 text-zinc-400" />
+                    <span>
+                      Joined{" "}
+                      {new Date(profile.created_at).toLocaleDateString("en-IN", {
+                        month: "short",
+                        year: "numeric",
+                      })}
+                    </span>
+                  </li>
+                </ul>
+              </div>
+
+              {/* SVG Language Breakdown Donut */}
+              <div className="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50/50 dark:bg-zinc-900/50 p-5">
+                <h3 className="text-sm font-semibold mb-4">Language Breakdown Donut</h3>
+                {aggregated.languages.length === 0 ? (
+                  <p className="text-xs text-zinc-500">No language metadata found.</p>
+                ) : (
+                  <div className="flex flex-col items-center gap-4">
+                    <div className="relative w-36 h-36">
+                      <svg viewBox="0 0 36 36" className="w-full h-full -rotate-90">
+                        {aggregated.donutSegments.map((seg) => (
+                          <circle
+                            key={seg.name}
+                            cx="18"
+                            cy="18"
+                            r="15.915"
+                            fill="transparent"
+                            stroke={seg.color}
+                            strokeWidth="3.8"
+                            strokeDasharray={`${seg.percent} ${100 - seg.percent}`}
+                            strokeDashoffset={-seg.startOffset}
+                          >
+                            <title>{`${seg.name}: ${seg.percent}% (${seg.count} repos)`}</title>
+                          </circle>
+                        ))}
+                      </svg>
+                      <div className="absolute inset-0 flex flex-col items-center justify-center text-center">
+                        <span className="text-lg font-bold">{aggregated.languages.length}</span>
+                        <span className="text-[10px] text-zinc-500 uppercase">Languages</span>
+                      </div>
+                    </div>
+
+                    <div className="w-full grid grid-cols-2 gap-1.5 text-xs">
+                      {aggregated.languages.slice(0, 8).map((l) => (
+                        <button
+                          key={l.name}
+                          onClick={() => {
+                            setRepoLanguage(repoLanguage === l.name ? "All" : l.name);
+                            setActiveTab("repos");
+                          }}
+                          className={`flex items-center justify-between px-2 py-1 rounded border text-left transition ${
+                            repoLanguage === l.name
+                              ? "border-blue-500 bg-blue-500/10"
+                              : "border-transparent hover:bg-zinc-200/60 dark:hover:bg-zinc-800/60"
+                          }`}
+                        >
+                          <span className="flex items-center gap-1.5 truncate">
+                            <span
+                              className="w-2.5 h-2.5 rounded-full shrink-0"
+                              style={{ backgroundColor: l.color }}
+                            />
+                            <span className="truncate font-medium">{l.name}</span>
+                          </span>
+                          <span className="text-zinc-500">{l.percent}%</span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            </aside>
+
+            {/* Right Main Column */}
+            <section className="lg:col-span-8 space-y-6">
+              {/* Aggregated Stats Cards */}
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                <div className="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50/50 dark:bg-zinc-900/50 p-4">
+                  <div className="flex items-center justify-between text-xs text-zinc-500">
+                    <span>Total Stars</span>
+                    <Star className="w-4 h-4 text-amber-400" />
+                  </div>
+                  <div className="text-2xl font-bold mt-1">{aggregated.stars.toLocaleString()}</div>
+                </div>
+
+                <div className="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50/50 dark:bg-zinc-900/50 p-4">
+                  <div className="flex items-center justify-between text-xs text-zinc-500">
+                    <span>Total Forks</span>
+                    <GitFork className="w-4 h-4 text-blue-400" />
+                  </div>
+                  <div className="text-2xl font-bold mt-1">{aggregated.forks.toLocaleString()}</div>
+                </div>
+
+                <div className="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50/50 dark:bg-zinc-900/50 p-4">
+                  <div className="flex items-center justify-between text-xs text-zinc-500">
+                    <span>Watchers</span>
+                    <Eye className="w-4 h-4 text-emerald-400" />
+                  </div>
+                  <div className="text-2xl font-bold mt-1">{aggregated.watchers.toLocaleString()}</div>
+                </div>
+
+                <div className="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50/50 dark:bg-zinc-900/50 p-4">
+                  <div className="flex items-center justify-between text-xs text-zinc-500">
+                    <span>Open Issues</span>
+                    <AlertCircle className="w-4 h-4 text-purple-400" />
+                  </div>
+                  <div className="text-2xl font-bold mt-1">{aggregated.openIssues.toLocaleString()}</div>
+                </div>
+              </div>
+
+              {/* Section Navigation Tabs */}
+              <div className="flex items-center gap-2 border-b border-zinc-200 dark:border-zinc-800">
+                <button
+                  onClick={() => setActiveTab("repos")}
+                  className={`inline-flex items-center gap-1.5 px-4 py-2.5 text-sm font-medium border-b-2 -mb-px transition ${
+                    activeTab === "repos"
+                      ? "border-blue-500 text-blue-500"
+                      : "border-transparent text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200"
+                  }`}
+                >
+                  <BookOpen className="w-4 h-4" />
+                  Repositories ({repos.length})
+                </button>
+                <button
+                  onClick={() => setActiveTab("analytics")}
+                  className={`inline-flex items-center gap-1.5 px-4 py-2.5 text-sm font-medium border-b-2 -mb-px transition ${
+                    activeTab === "analytics"
+                      ? "border-blue-500 text-blue-500"
+                      : "border-transparent text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200"
+                  }`}
+                >
+                  <BarChart3 className="w-4 h-4" />
+                  Visual Analytics
+                </button>
+                <button
+                  onClick={() => setActiveTab("activity")}
+                  className={`inline-flex items-center gap-1.5 px-4 py-2.5 text-sm font-medium border-b-2 -mb-px transition ${
+                    activeTab === "activity"
+                      ? "border-blue-500 text-blue-500"
+                      : "border-transparent text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200"
+                  }`}
+                >
+                  <Activity className="w-4 h-4" />
+                  Activity Feed ({events.length})
+                </button>
+              </div>
+
+              {/* TAB 1: Repository Browser */}
+              {activeTab === "repos" && (
+                <div className="space-y-4">
+                  <div className="flex flex-col sm:flex-row gap-3">
+                    <input
+                      type="text"
+                      value={repoKeyword}
+                      onChange={(e) => setRepoKeyword(e.target.value)}
+                      placeholder="Filter repos by name, description, or topic..."
+                      className="flex-1 rounded-lg border border-zinc-300 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-900 px-3.5 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    />
+                    <select
+                      value={repoLanguage}
+                      onChange={(e) => setRepoLanguage(e.target.value)}
+                      aria-label="Filter by language"
+                      className="rounded-lg border border-zinc-300 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-900 px-3 py-2 text-sm"
+                    >
+                      <option value="All">All Languages</option>
+                      {aggregated.languages.map((l) => (
+                        <option key={l.name} value={l.name}>
+                          {l.name} ({l.count})
+                        </option>
+                      ))}
+                    </select>
+                    <select
+                      value={repoSort}
+                      onChange={(e) => setRepoSort(e.target.value as any)}
+                      aria-label="Sort repositories"
+                      className="rounded-lg border border-zinc-300 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-900 px-3 py-2 text-sm"
+                    >
+                      <option value="stars">Sort: Stars</option>
+                      <option value="updated">Sort: Last Push</option>
+                      <option value="name">Sort: Name</option>
+                    </select>
+                  </div>
+
+                  {filteredRepos.length === 0 ? (
+                    <div className="rounded-xl border border-zinc-200 dark:border-zinc-800 p-8 text-center text-sm text-zinc-500">
+                      No matching repositories found.
+                    </div>
+                  ) : (
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                      {filteredRepos.map((repo) => (
+                        <div
+                          key={repo.id}
+                          onClick={() => handleOpenRepoDrawer(repo)}
+                          className="group cursor-pointer rounded-xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50/40 dark:bg-zinc-900/40 hover:border-blue-500/60 p-4 transition flex flex-col justify-between"
+                        >
+                          <div>
+                            <div className="flex items-start justify-between gap-2">
+                              <h3 className="font-semibold text-blue-500 group-hover:underline truncate">
+                                {repo.name}
+                              </h3>
+                              <span className="text-[10px] px-2 py-0.5 rounded-full border border-zinc-300 dark:border-zinc-700 text-zinc-500">
+                                Public
+                              </span>
+                            </div>
+                            <p className="text-xs text-zinc-600 dark:text-zinc-400 mt-1.5 line-clamp-2 min-h-[2rem]">
+                              {repo.description || "No description provided — click to view README."}
+                            </p>
+                            {repo.topics && repo.topics.length > 0 && (
+                              <div className="flex flex-wrap gap-1 mt-2.5">
+                                {repo.topics.slice(0, 4).map((t) => (
+                                  <span
+                                    key={t}
+                                    className="text-[10px] px-2 py-0.5 rounded bg-blue-500/10 text-blue-400 font-medium"
+                                  >
+                                    {t}
+                                  </span>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+
+                          <div className="flex items-center justify-between text-xs text-zinc-500 mt-4 pt-3 border-t border-zinc-200/60 dark:border-zinc-800/60">
+                            <div className="flex items-center gap-3">
+                              {repo.language && (
+                                <span className="flex items-center gap-1">
+                                  <span
+                                    className="w-2.5 h-2.5 rounded-full"
+                                    style={{
+                                      backgroundColor: LANG_COLORS[repo.language] || LANG_COLORS.Other,
+                                    }}
+                                  />
+                                  {repo.language}
+                                </span>
+                              )}
+                              <span>★ {repo.stargazers_count}</span>
+                              <span>⑂ {repo.forks_count}</span>
+                            </div>
+                            <span>Pushed {formatRelativeTime(repo.pushed_at)}</span>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* TAB 2: Visual Analytics */}
+              {activeTab === "analytics" && (
+                <div className="space-y-6">
+                  {/* Commit / Event Contribution Heatmap */}
+                  <div className="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50/40 dark:bg-zinc-900/40 p-5">
+                    <div className="flex items-center justify-between mb-3">
+                      <h3 className="text-sm font-semibold">
+                        Public Event Contribution Heatmap (Last 16 Weeks)
+                      </h3>
+                      <span className="text-xs text-zinc-500">{events.length} events sampled</span>
+                    </div>
+                    <div className="flex gap-1.5 overflow-x-auto pb-2">
+                      {heatmapGrid.map((week, wIndex) => (
+                        <div key={wIndex} className="flex flex-col gap-1.5">
+                          {week.map((day) => {
+                            const cellColor =
+                              day.count === 0
+                                ? "bg-zinc-200 dark:bg-zinc-800"
+                                : day.count === 1
+                                ? "bg-emerald-800"
+                                : day.count <= 3
+                                ? "bg-emerald-600"
+                                : "bg-emerald-400";
+                            return (
+                              <div
+                                key={day.date}
+                                title={`${day.date}: ${day.count} public event(s)`}
+                                className={`w-3.5 h-3.5 rounded-sm ${cellColor}`}
+                              />
+                            );
+                          })}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Repos-by-Stars Bar Chart */}
+                  <div className="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50/40 dark:bg-zinc-900/40 p-5">
+                    <h3 className="text-sm font-semibold mb-4">Top Repositories by Stars & Activity</h3>
+                    <div className="space-y-3">
+                      {aggregated.topRepos.map((r) => {
+                        const maxStars = Math.max(
+                          ...aggregated.topRepos.map((x) => x.stargazers_count),
+                          1
+                        );
+                        const pct = Math.max(Math.round((r.stargazers_count / maxStars) * 100), 8);
+                        return (
+                          <div key={r.id} className="space-y-1">
+                            <div className="flex justify-between text-xs">
+                              <button
+                                onClick={() => handleOpenRepoDrawer(r)}
+                                className="font-medium text-blue-500 hover:underline"
+                              >
+                                {r.name}
+                              </button>
+                              <span className="text-zinc-500">
+                                ★ {r.stargazers_count} · ⑂ {r.forks_count} · {r.language || "Code"}
+                              </span>
+                            </div>
+                            <div className="w-full h-2.5 rounded-full bg-zinc-200 dark:bg-zinc-800 overflow-hidden">
+                              <div
+                                className="h-full bg-blue-600 rounded-full transition-all"
+                                style={{ width: `${pct}%` }}
+                              />
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* TAB 3: Public Activity Feed */}
+              {activeTab === "activity" && (
+                <div className="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50/40 dark:bg-zinc-900/40 divide-y divide-zinc-200 dark:divide-zinc-800">
+                  {events.length === 0 ? (
+                    <div className="p-8 text-center text-sm text-zinc-500">
+                      No recent public activity events returned by GitHub.
+                    </div>
+                  ) : (
+                    events.slice(0, 30).map((ev) => (
+                      <div key={ev.id} className="p-4 flex items-start justify-between gap-4 text-sm">
+                        <div className="space-y-1">
+                          <div className="flex items-center gap-1.5 flex-wrap">
+                            <GitCommit className="w-4 h-4 text-blue-500 shrink-0" />
+                            <span>{describeEvent(ev)}</span>
+                            <a
+                              href={`https://github.com/${ev.repo.name}`}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="text-blue-500 hover:underline font-mono text-xs"
+                            >
+                              {ev.repo.name}
+                            </a>
+                          </div>
+                          {ev.payload?.commits && ev.payload.commits.length > 0 && (
+                            <ul className="text-xs text-zinc-500 space-y-0.5 pl-4 border-l-2 border-zinc-300 dark:border-zinc-700 mt-1">
+                              {ev.payload.commits.slice(0, 3).map((c) => (
+                                <li key={c.sha} className="truncate max-w-xl">
+                                  <code className="text-blue-400 mr-1.5">{c.sha.slice(0, 7)}</code>
+                                  {c.message}
+                                </li>
+                              ))}
+                            </ul>
+                          )}
+                        </div>
+                        <span className="text-xs text-zinc-500 whitespace-nowrap">
+                          {formatRelativeTime(ev.created_at)}
+                        </span>
+                      </div>
+                    ))
+                  )}
+                </div>
+              )}
+            </section>
+          </div>
+        )}
+      </main>
+
+      {/* Slide-Over Repo README Drawer */}
+      {drawerRepo && (
+        <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex justify-end">
+          <div className="w-full max-w-2xl bg-white dark:bg-zinc-950 border-l border-zinc-200 dark:border-zinc-800 h-full flex flex-col shadow-2xl">
+            <div className="p-4 border-b border-zinc-200 dark:border-zinc-800 flex items-center justify-between">
+              <div>
+                <h3 className="font-bold text-base">{drawerRepo.full_name}</h3>
+                <p className="text-xs text-zinc-500">
+                  ★ {drawerRepo.stargazers_count} · ⑂ {drawerRepo.forks_count} · Open Issues:{" "}
+                  {drawerRepo.open_issues_count}
+                </p>
+              </div>
+              <div className="flex items-center gap-2">
+                <a
+                  href={drawerRepo.html_url}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg bg-blue-600 text-white text-xs font-medium"
+                >
+                  GitHub <ExternalLink className="w-3.5 h-3.5" />
+                </a>
+                <button
+                  onClick={() => setDrawerRepo(null)}
+                  aria-label="Close README drawer"
+                  className="p-1.5 rounded-lg border border-zinc-200 dark:border-zinc-800"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+            <div className="p-6 overflow-y-auto flex-1 prose dark:prose-invert max-w-none text-sm">
+              {readmeLoading ? (
+                <div className="flex items-center gap-2 text-zinc-500 animate-pulse">
+                  <RefreshCw className="w-4 h-4 animate-spin" /> Loading README.md...
+                </div>
+              ) : (
+                <div dangerouslySetInnerHTML={{ __html: readmeHtml }} />
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Optional Personal Access Token Modal */}
+      {tokenModalOpen && (
+        <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="w-full max-w-md rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-950 p-6 space-y-4 shadow-xl">
+            <div className="flex items-center justify-between">
+              <h3 className="font-bold text-base">GitHub API Token (Optional)</h3>
+              <button onClick={() => setTokenModalOpen(false)}>
+                <X className="w-4 h-4 text-zinc-500" />
+              </button>
+            </div>
+            <p className="text-xs text-zinc-500 leading-relaxed">
+              Unauthenticated browser requests to GitHub&apos;s REST API are limited to 60 requests/hr.
+              Providing a classic or fine-grained read-only Personal Access Token increases your quota
+              to 5,000 requests/hr.
+            </p>
+            <input
+              type="password"
+              value={token}
+              onChange={(e) => {
+                setToken(e.target.value);
+                localStorage.setItem("gh_explorer_pat", e.target.value);
+              }}
+              placeholder="ghp_xxxxxxxxxxxxxxxxxxxx"
+              className="w-full rounded-lg border border-zinc-300 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-900 px-3 py-2 text-sm"
+            />
+            <div className="flex justify-end gap-2">
+              <button
+                onClick={() => {
+                  setToken("");
+                  localStorage.removeItem("gh_explorer_pat");
+                }}
+                className="px-3 py-1.5 rounded-lg border border-zinc-200 dark:border-zinc-800 text-xs"
+              >
+                Clear Token
+              </button>
+              <button
+                onClick={() => setTokenModalOpen(false)}
+                className="px-4 py-1.5 rounded-lg bg-blue-600 text-white text-xs font-medium"
+              >
+                Save & Done
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
